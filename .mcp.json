@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "talk-to-figma": {
+      "command": "bun",
+      "args": [
+        "run",
+        "/Users/mohammadreza/Documents/code/personal/figma-ai-bridge/dist/server.js"
+      ]
+    }
+  }
+}
