@@ -932,6 +932,32 @@ server.tool(
   }
 );
 
+// Set Text Style Tool
+server.tool(
+  "set_text_style",
+  "Set typographic style on a text node: letterSpacing (px), lineHeight (px), fontSize (px), fontWeight (400/500/600/700/800). All optional.",
+  {
+    nodeId: z.string().describe("The ID of the text node to modify"),
+    letterSpacing: z.number().optional().describe("Letter spacing in pixels (can be negative)"),
+    lineHeight: z.number().optional().describe("Line height in pixels"),
+    fontSize: z.number().optional().describe("Font size in pixels"),
+    fontWeight: z.number().optional().describe("Font weight: 400, 500, 600, 700, or 800"),
+  },
+  async (p: any) => {
+    try {
+      const result = await sendCommandToFigma("set_text_style", p);
+      const typedResult = result as { name: string };
+      return {
+        content: [{ type: "text", text: `Set text style on node "${typedResult.name}"` }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting text style: ${error instanceof Error ? error.message : String(error)}` }],
+      };
+    }
+  }
+);
+
 // Get Styles Tool
 server.tool(
   "get_styles",
@@ -2882,6 +2908,127 @@ server.tool(
   }
 );
 
+server.tool(
+  "combine_as_variants",
+  "Combine 2+ existing main components into a single component set (variants). Name each source component with 'Prop=Value' pairs (e.g. 'Size=Large, State=Hover') so Figma derives the variant axes. Returns the new component set with its variant property axes.",
+  {
+    nodeIds: z.array(z.string()).min(2).describe("IDs of the COMPONENT nodes to combine into a variant set"),
+    name: z.string().optional().describe("Name for the resulting component set"),
+    parentId: z.string().optional().describe("Optional parent node ID to host the set (defaults to first component's parent / current page)"),
+  },
+  async (p: any) => {
+    try { return ok("Combined as variants", await sendCommandToFigma("combine_as_variants", p)); }
+    catch (e) { return fail("combining as variants", e); }
+  }
+);
+
+server.tool(
+  "create_component_property",
+  "Add a component property (BOOLEAN, TEXT, or INSTANCE_SWAP) to a component or component set. VARIANT axes are handled by combine_as_variants and cannot be added here.",
+  {
+    nodeId: z.string().describe("ID of the COMPONENT or COMPONENT_SET"),
+    propertyName: z.string().describe("Property name, e.g. 'Has Icon', 'Label'"),
+    type: z.enum(["BOOLEAN", "TEXT", "INSTANCE_SWAP"]).describe("Property type"),
+    defaultValue: z.union([z.string(), z.boolean()]).describe("Default value: boolean for BOOLEAN, string for TEXT, component key for INSTANCE_SWAP"),
+    preferredValues: z.array(z.object({ type: z.enum(["COMPONENT", "COMPONENT_SET"]), key: z.string() })).optional().describe("For INSTANCE_SWAP: suggested swap targets"),
+  },
+  async (p: any) => {
+    try { return ok("Created component property", await sendCommandToFigma("create_component_property", p)); }
+    catch (e) { return fail("creating component property", e); }
+  }
+);
+
+server.tool(
+  "set_variant_properties",
+  "Set the variant axis values on a single variant component (inside a set) by renaming it. Pass properties as { Size: 'Large', State: 'Hover' }.",
+  {
+    nodeId: z.string().describe("ID of the COMPONENT (a variant inside a component set)"),
+    properties: z.record(z.string()).describe("Variant axis values, e.g. { Size: 'Large', State: 'Hover' }"),
+  },
+  async (p: any) => {
+    try { return ok("Set variant properties", await sendCommandToFigma("set_variant_properties", p)); }
+    catch (e) { return fail("setting variant properties", e); }
+  }
+);
+
+// --- Phase 2: Style authoring (token-driven output) ---
+
+server.tool(
+  "create_paint_style",
+  "Create a shared paint (color) style. Color uses the 0-1 RGBA range. Use slash naming for grouping, e.g. 'Brand/Primary'.",
+  {
+    name: z.string().describe("Style name; slash-grouped e.g. 'Brand/Primary'"),
+    color: z.object({
+      r: z.number(), g: z.number(), b: z.number(),
+      a: z.number().optional(),
+    }).describe("Color in 0-1 range; a is optional opacity"),
+    opacity: z.number().min(0).max(1).optional().describe("Opacity 0-1 (overrides color.a)"),
+  },
+  async (p: any) => {
+    try { return ok("Created paint style", await sendCommandToFigma("create_paint_style", p)); }
+    catch (e) { return fail("creating paint style", e); }
+  }
+);
+
+server.tool(
+  "create_text_style",
+  "Create a shared text (typography) style. The font is loaded before the style is created.",
+  {
+    name: z.string().describe("Style name; slash-grouped e.g. 'Heading/H1'"),
+    fontFamily: z.string().optional().describe("Font family (default 'Inter')"),
+    fontStyle: z.string().optional().describe("Font style/weight, e.g. 'Regular', 'Bold' (default 'Regular')"),
+    fontSize: z.number().positive().optional().describe("Font size in px"),
+    lineHeight: z.number().optional().describe("Line height in px"),
+    letterSpacing: z.number().optional().describe("Letter spacing in px"),
+  },
+  async (p: any) => {
+    try { return ok("Created text style", await sendCommandToFigma("create_text_style", p)); }
+    catch (e) { return fail("creating text style", e); }
+  }
+);
+
+server.tool(
+  "create_effect_style",
+  "Create a shared effect style (drop/inner shadow or layer/background blur).",
+  {
+    name: z.string().describe("Style name; slash-grouped e.g. 'Elevation/Card'"),
+    effects: z.array(z.object({
+      type: z.enum(["DROP_SHADOW", "INNER_SHADOW", "LAYER_BLUR", "BACKGROUND_BLUR"]),
+      visible: z.boolean().optional(),
+      color: z.object({ r: z.number(), g: z.number(), b: z.number(), a: z.number().optional() }).optional(),
+      offset: z.object({ x: z.number(), y: z.number() }).optional(),
+      radius: z.number().optional(),
+      spread: z.number().optional(),
+      blendMode: z.string().optional(),
+    })).describe("Effects array (shadows need color/offset/radius; blurs need radius)"),
+  },
+  async (p: any) => {
+    try { return ok("Created effect style", await sendCommandToFigma("create_effect_style", p)); }
+    catch (e) { return fail("creating effect style", e); }
+  }
+);
+
+server.tool(
+  "create_grid_style",
+  "Create a shared layout-grid style.",
+  {
+    name: z.string().describe("Style name; slash-grouped e.g. 'Grid/Desktop'"),
+    layoutGrids: z.array(z.object({
+      pattern: z.enum(["COLUMNS", "ROWS", "GRID"]),
+      sectionSize: z.number().optional(),
+      visible: z.boolean().optional(),
+      gutterSize: z.number().optional(),
+      alignment: z.enum(["MIN", "MAX", "CENTER", "STRETCH"]).optional(),
+      count: z.number().optional(),
+      offset: z.number().optional(),
+    }).passthrough()).describe("Layout grids array"),
+  },
+  async (p: any) => {
+    try { return ok("Created grid style", await sendCommandToFigma("create_grid_style", p)); }
+    catch (e) { return fail("creating grid style", e); }
+  }
+);
+
 
 // Define command types and parameters
 type FigmaCommand =
@@ -2909,6 +3056,7 @@ type FigmaCommand =
   | "set_corner_radius"
   | "clone_node"
   | "set_text_content"
+  | "set_text_style"
   | "scan_text_nodes"
   | "set_multiple_text_contents"
   | "get_annotations"
@@ -2941,7 +3089,14 @@ type FigmaCommand =
   | "ungroup_node"
   | "reorder_node"
   | "boolean_operation"
-  | "create_component_from_node";
+  | "create_component_from_node"
+  | "combine_as_variants"
+  | "create_component_property"
+  | "set_variant_properties"
+  | "create_paint_style"
+  | "create_text_style"
+  | "create_effect_style"
+  | "create_grid_style";
 
 type CommandParams = {
   get_document_info: Record<string, never>;

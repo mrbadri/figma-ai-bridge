@@ -174,6 +174,8 @@ async function handleCommand(command, params) {
       return await setCornerRadius(params);
     case "set_text_content":
       return await setTextContent(params);
+    case "set_text_style":
+      return await setTextStyle(params);
     case "clone_node":
       return await cloneNode(params);
     case "scan_text_nodes":
@@ -289,6 +291,20 @@ async function handleCommand(command, params) {
       return await booleanOperation(params);
     case "create_component_from_node":
       return await createComponentFromNode(params);
+    case "combine_as_variants":
+      return await combineAsVariants(params);
+    case "create_component_property":
+      return await createComponentProperty(params);
+    case "set_variant_properties":
+      return await setVariantProperties(params);
+    case "create_paint_style":
+      return await createPaintStyle(params);
+    case "create_text_style":
+      return await createTextStyle(params);
+    case "create_effect_style":
+      return await createEffectStyle(params);
+    case "create_grid_style":
+      return await createGridStyle(params);
     default:
       throw new Error(`Unknown command: ${command}`);
   }
@@ -1517,6 +1533,50 @@ async function setTextContent(params) {
   } catch (error) {
     throw new Error(`Error setting text content: ${error.message}`);
   }
+}
+
+// Set typographic style on a text node: letterSpacing, lineHeight,
+// fontSize, and fontWeight (via font style name). All fields optional.
+async function setTextStyle(params) {
+  const { nodeId, letterSpacing, lineHeight, fontSize, fontWeight } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found with ID: ${nodeId}`);
+  if (node.type !== "TEXT") throw new Error(`Node is not a text node: ${nodeId}`);
+
+  await figma.loadFontAsync(node.fontName);
+
+  if (letterSpacing !== undefined) {
+    // Accept a number (px) or {value, unit}.
+    node.letterSpacing =
+      typeof letterSpacing === "object"
+        ? letterSpacing
+        : { value: parseFloat(letterSpacing) || 0, unit: "PIXELS" };
+  }
+  if (lineHeight !== undefined) {
+    node.lineHeight =
+      typeof lineHeight === "object"
+        ? lineHeight
+        : { value: parseFloat(lineHeight) || 0, unit: "PIXELS" };
+  }
+  if (fontSize !== undefined) node.fontSize = parseFloat(fontSize) || node.fontSize;
+  if (fontWeight !== undefined) {
+    const styleMap = { 400: "Regular", 500: "Medium", 600: "Semi Bold", 700: "Bold", 800: "Extra Bold" };
+    const styleName = styleMap[fontWeight];
+    if (styleName) {
+      const nextFont = { family: node.fontName.family, style: styleName };
+      await figma.loadFontAsync(nextFont);
+      node.fontName = nextFont;
+    }
+  }
+  return {
+    id: node.id,
+    name: node.name,
+    letterSpacing: node.letterSpacing,
+    lineHeight: node.lineHeight,
+    fontSize: node.fontSize,
+    fontName: node.fontName,
+  };
 }
 
 // Initialize settings on load
@@ -4369,8 +4429,13 @@ async function getVariables() {
 }
 
 async function createVariable(params) {
-  const { collectionName, variableName, resolvedType = "COLOR", value, modeName } = params || {};
+  const { collectionName, variableName, resolvedType = "COLOR", modeName } = params || {};
+  let value = params && params.value;
   if (!collectionName || !variableName) throw new Error("Missing collectionName or variableName");
+  // value may arrive as a JSON string over the wire; parse it back to an object.
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch (e) { /* leave as-is */ }
+  }
   const collections = await figma.variables.getLocalVariableCollectionsAsync();
   let collection = collections.find((c) => c.name === collectionName);
   if (!collection) collection = figma.variables.createVariableCollection(collectionName);
@@ -4380,7 +4445,7 @@ async function createVariable(params) {
     mode = found || mode;
   }
   const variable = figma.variables.createVariable(variableName, collection, resolvedType);
-  if (value !== undefined) {
+  if (value !== undefined && value !== null) {
     let modeValue = value;
     if (resolvedType === "COLOR") {
       modeValue = {
@@ -4389,10 +4454,20 @@ async function createVariable(params) {
         b: parseFloat(value.b) || 0,
         a: value.a !== undefined ? parseFloat(value.a) : 1,
       };
+    } else if (resolvedType === "FLOAT") {
+      modeValue = parseFloat(value) || 0;
+    } else if (resolvedType === "BOOLEAN") {
+      modeValue = value === true || value === "true";
+    } else {
+      modeValue = String(value);
     }
+    // Write to the requested mode and to every mode so the value always resolves.
     variable.setValueForMode(mode.modeId, modeValue);
+    for (const m of collection.modes) {
+      try { variable.setValueForMode(m.modeId, modeValue); } catch (e) { /* skip */ }
+    }
   }
-  return { id: variable.id, name: variable.name, key: variable.key, collectionId: collection.id, resolvedType };
+  return { id: variable.id, name: variable.name, key: variable.key, collectionId: collection.id, resolvedType, value };
 }
 
 // Bind a variable to a node field. Paint fields (fills/strokes) use
@@ -4526,4 +4601,181 @@ async function createComponentFromNode(params) {
   const component = figma.createComponentFromNode(node);
   if (name) component.name = name;
   return { id: component.id, name: component.name, key: component.key, type: component.type };
+}
+
+// Combine existing components into a single component set (variants).
+// Each component should be named with "Prop=Value" pairs (e.g. "Size=Large, State=Hover")
+// so Figma derives the variant property axes. Returns the new ComponentSet.
+async function combineAsVariants(params) {
+  const { nodeIds, name, parentId } = params || {};
+  if (!nodeIds || !Array.isArray(nodeIds) || nodeIds.length < 2) {
+    throw new Error("combine_as_variants requires nodeIds (array of at least 2 component IDs)");
+  }
+
+  const components = [];
+  for (const id of nodeIds) {
+    const node = await figma.getNodeByIdAsync(id);
+    if (!node) throw new Error(`Node not found with ID: ${id}`);
+    if (node.type !== "COMPONENT") {
+      throw new Error(`Node ${id} is type ${node.type}; combine_as_variants requires COMPONENT nodes`);
+    }
+    components.push(node);
+  }
+
+  // Determine the parent to host the component set.
+  let parent = figma.currentPage;
+  if (parentId) {
+    const p = await figma.getNodeByIdAsync(parentId);
+    if (!p) throw new Error(`Parent not found with ID: ${parentId}`);
+    parent = p;
+  } else if (components[0].parent) {
+    parent = components[0].parent;
+  }
+
+  const componentSet = figma.combineAsVariants(components, parent);
+  if (name) componentSet.name = name;
+
+  return {
+    id: componentSet.id,
+    name: componentSet.name,
+    key: componentSet.key,
+    type: componentSet.type,
+    variantCount: componentSet.children.length,
+    variantProperties: componentSet.variantGroupProperties || {},
+  };
+}
+
+// Add a component property (BOOLEAN, TEXT, INSTANCE_SWAP) to a component or component set.
+// VARIANT properties are managed automatically by combine_as_variants and cannot be added here.
+async function createComponentProperty(params) {
+  const { nodeId, propertyName, type, defaultValue, preferredValues } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  if (!propertyName) throw new Error("Missing propertyName parameter");
+  if (!type) throw new Error("Missing type parameter (BOOLEAN | TEXT | INSTANCE_SWAP)");
+
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found with ID: ${nodeId}`);
+  if (node.type !== "COMPONENT" && node.type !== "COMPONENT_SET") {
+    throw new Error(`Node ${nodeId} is type ${node.type}; expected COMPONENT or COMPONENT_SET`);
+  }
+
+  const options = {};
+  if (type === "INSTANCE_SWAP" && preferredValues) {
+    options.preferredValues = preferredValues; // [{ type: "COMPONENT", key }]
+  }
+
+  const propertyId = node.addComponentProperty(propertyName, type, defaultValue, options);
+  return {
+    id: node.id,
+    propertyId,
+    propertyName,
+    type,
+    componentPropertyDefinitions: node.componentPropertyDefinitions || {},
+  };
+}
+
+// Set variant axis values on an individual variant component by (re)naming it.
+// Pass properties as an object: { Size: "Large", State: "Hover" }.
+async function setVariantProperties(params) {
+  const { nodeId, properties } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  if (!properties || typeof properties !== "object") {
+    throw new Error("Missing properties object, e.g. { Size: 'Large', State: 'Hover' }");
+  }
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found with ID: ${nodeId}`);
+  if (node.type !== "COMPONENT") {
+    throw new Error(`Node ${nodeId} is type ${node.type}; setting variant properties requires a COMPONENT inside a set`);
+  }
+  const pairs = Object.keys(properties).map((k) => `${k}=${properties[k]}`);
+  node.name = pairs.join(", ");
+  return { id: node.id, name: node.name };
+}
+
+// Create a shared paint (color) style. Color uses the 0-1 RGBA range (per project convention).
+// Use slash naming for grouping, e.g. "Brand/Primary".
+async function createPaintStyle(params) {
+  const { name, color, opacity } = params || {};
+  if (!name) throw new Error("Missing name parameter");
+  if (!color) throw new Error("Missing color parameter");
+  const style = figma.createPaintStyle();
+  style.name = name;
+  const a = color.a !== undefined ? parseFloat(color.a) : 1;
+  style.paints = [
+    {
+      type: "SOLID",
+      color: {
+        r: parseFloat(color.r) || 0,
+        g: parseFloat(color.g) || 0,
+        b: parseFloat(color.b) || 0,
+      },
+      opacity: opacity !== undefined ? parseFloat(opacity) : a,
+    },
+  ];
+  return { id: style.id, name: style.name, key: style.key };
+}
+
+// Create a shared text (typography) style. Font must be loaded before assigning.
+async function createTextStyle(params) {
+  const { name, fontFamily, fontStyle, fontSize, lineHeight, letterSpacing } = params || {};
+  if (!name) throw new Error("Missing name parameter");
+  const fontName = { family: fontFamily || "Inter", style: fontStyle || "Regular" };
+  await figma.loadFontAsync(fontName);
+  const style = figma.createTextStyle();
+  style.name = name;
+  style.fontName = fontName;
+  if (fontSize !== undefined) style.fontSize = parseFloat(fontSize);
+  if (lineHeight !== undefined) {
+    style.lineHeight =
+      typeof lineHeight === "object"
+        ? lineHeight
+        : { value: parseFloat(lineHeight), unit: "PIXELS" };
+  }
+  if (letterSpacing !== undefined) {
+    style.letterSpacing =
+      typeof letterSpacing === "object"
+        ? letterSpacing
+        : { value: parseFloat(letterSpacing), unit: "PIXELS" };
+  }
+  return { id: style.id, name: style.name, key: style.key };
+}
+
+// Create a shared effect style (shadows / blurs). Effects mirror the set_effects shape.
+async function createEffectStyle(params) {
+  const { name, effects } = params || {};
+  if (!name) throw new Error("Missing name parameter");
+  if (!Array.isArray(effects)) throw new Error("effects must be an array");
+  const style = figma.createEffectStyle();
+  style.name = name;
+  style.effects = effects.map((e) => {
+    const eff = { type: e.type, visible: e.visible !== false };
+    if (e.type === "DROP_SHADOW" || e.type === "INNER_SHADOW") {
+      eff.color = {
+        r: parseFloat(e.color.r) || 0,
+        g: parseFloat(e.color.g) || 0,
+        b: parseFloat(e.color.b) || 0,
+        a: e.color.a !== undefined ? parseFloat(e.color.a) : 1,
+      };
+      eff.offset = { x: (e.offset && e.offset.x) || 0, y: (e.offset && e.offset.y) || 0 };
+      eff.radius = e.radius || 0;
+      eff.spread = e.spread || 0;
+      eff.blendMode = e.blendMode || "NORMAL";
+    } else {
+      // LAYER_BLUR / BACKGROUND_BLUR
+      eff.radius = e.radius || 0;
+    }
+    return eff;
+  });
+  return { id: style.id, name: style.name, key: style.key };
+}
+
+// Create a shared layout-grid style.
+async function createGridStyle(params) {
+  const { name, layoutGrids } = params || {};
+  if (!name) throw new Error("Missing name parameter");
+  if (!Array.isArray(layoutGrids)) throw new Error("layoutGrids must be an array");
+  const style = figma.createGridStyle();
+  style.name = name;
+  style.layoutGrids = layoutGrids;
+  return { id: style.id, name: style.name, key: style.key };
 }

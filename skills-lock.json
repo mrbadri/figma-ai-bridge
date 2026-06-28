@@ -1,11 +1,35 @@
 {
   "version": 1,
   "skills": {
+    "accessibility": {
+      "source": "addyosmani/web-quality-skills",
+      "sourceType": "github",
+      "skillPath": "skills/accessibility/SKILL.md",
+      "computedHash": "10e83284d3395ab5ec2f2db602b663480a37a4ff404d16510eefe86b034fcc1a"
+    },
+    "baseline-ui": {
+      "source": "ibelick/ui-skills",
+      "sourceType": "github",
+      "skillPath": "skills/baseline-ui/SKILL.md",
+      "computedHash": "dfcb3e778b57ad1cba92375689bb8265fa5aef78fba523a744f5220b3c619901"
+    },
     "figma-generate-design": {
       "source": "figma/mcp-server-guide",
       "sourceType": "github",
       "skillPath": "skills/figma-generate-design/SKILL.md",
       "computedHash": "e4cbfb6e0a6ed1607cc138d5f693257a7f06ae55b88fd38bc511ab3032675f42"
+    },
+    "shadcn": {
+      "source": "shadcn/ui",
+      "sourceType": "github",
+      "skillPath": "skills/shadcn/SKILL.md",
+      "computedHash": "ac9d0d69caac7de1d1e5647f3db3bcd2f13af355d6b3a78780fbf7fc80e8dca0"
+    },
+    "ui-ux-pro-max": {
+      "source": "nextlevelbuilder/ui-ux-pro-max-skill",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/ui-ux-pro-max/SKILL.md",
+      "computedHash": "c0e71f1ea9d80c74f710960c2b4d9ab0f8a6d14c331f8d361df2c28d1879846e"
     }
   }
 }
