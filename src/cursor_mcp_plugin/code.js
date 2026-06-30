@@ -134,14 +134,20 @@ async function handleCommand(command, params) {
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
       }
-      return await getNodeInfo(params.nodeId);
+      return await getNodeInfo(params.nodeId, {
+        depth: params.depth,
+        fields: params.fields,
+      });
     case "get_nodes_info":
       if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
         throw new Error("Missing or invalid nodeIds parameter");
       }
-      return await getNodesInfo(params.nodeIds);
+      return await getNodesInfo(params.nodeIds, {
+        depth: params.depth,
+        fields: params.fields,
+      });
     case "read_my_design":
-      return await readMyDesign();
+      return await readMyDesign(params || {});
     case "create_rectangle":
       return await createRectangle(params);
     case "create_frame":
@@ -378,10 +384,16 @@ function rgbaToHex(color) {
   );
 }
 
-function filterFigmaNode(node) {
+function filterFigmaNode(node, opts) {
   if (node.type === "VECTOR") {
     return null;
   }
+
+  opts = opts || {};
+  var level = opts._level || 0;
+  // layoutOnly drops heavy appearance keys (fills/strokes/styles), keeping
+  // geometry, hierarchy and text content — much cheaper for "understand layout" reads.
+  var layoutOnly = opts.fields === "layout";
 
   var filtered = {
     id: node.id,
@@ -389,7 +401,7 @@ function filterFigmaNode(node) {
     type: node.type,
   };
 
-  if (node.fills && node.fills.length > 0) {
+  if (!layoutOnly && node.fills && node.fills.length > 0) {
     filtered.fills = node.fills.map((fill) => {
       var processedFill = Object.assign({}, fill);
       delete processedFill.boundVariables;
@@ -416,7 +428,7 @@ function filterFigmaNode(node) {
     });
   }
 
-  if (node.strokes && node.strokes.length > 0) {
+  if (!layoutOnly && node.strokes && node.strokes.length > 0) {
     filtered.strokes = node.strokes.map((stroke) => {
       var processedStroke = Object.assign({}, stroke);
       delete processedStroke.boundVariables;
@@ -439,7 +451,7 @@ function filterFigmaNode(node) {
     filtered.characters = node.characters;
   }
 
-  if (node.style) {
+  if (!layoutOnly && node.style) {
     filtered.style = {
       fontFamily: node.style.fontFamily,
       fontStyle: node.style.fontStyle,
@@ -451,20 +463,30 @@ function filterFigmaNode(node) {
     };
   }
 
-  if (node.children) {
+  // Stop recursing once we hit the requested depth (depth counts levels of children).
+  var atDepthLimit = opts.depth !== undefined && level + 1 >= opts.depth;
+  if (node.children && !atDepthLimit) {
+    var childOpts = {
+      depth: opts.depth,
+      fields: opts.fields,
+      _level: level + 1,
+    };
     filtered.children = node.children
       .map((child) => {
-        return filterFigmaNode(child);
+        return filterFigmaNode(child, childOpts);
       })
       .filter((child) => {
         return child !== null;
       });
+  } else if (node.children && node.children.length > 0) {
+    // Signal that children exist but were trimmed by the depth limit.
+    filtered.childCount = node.children.length;
   }
 
   return filtered;
 }
 
-async function getNodeInfo(nodeId) {
+async function getNodeInfo(nodeId, opts) {
   const node = await figma.getNodeByIdAsync(nodeId);
 
   if (!node) {
@@ -475,10 +497,10 @@ async function getNodeInfo(nodeId) {
     format: "JSON_REST_V1",
   });
 
-  return filterFigmaNode(response.document);
+  return filterFigmaNode(response.document, opts);
 }
 
-async function getNodesInfo(nodeIds) {
+async function getNodesInfo(nodeIds, opts) {
   try {
     // Load all nodes in parallel
     const nodes = await Promise.all(
@@ -496,7 +518,7 @@ async function getNodesInfo(nodeIds) {
         });
         return {
           nodeId: node.id,
-          document: filterFigmaNode(response.document),
+          document: filterFigmaNode(response.document, opts),
         };
       })
     );
@@ -692,7 +714,7 @@ async function getReactions(nodeIds) {
   }
 }
 
-async function readMyDesign() {
+async function readMyDesign(opts) {
   try {
     // Load all selected nodes in parallel
     const nodes = await Promise.all(
@@ -710,7 +732,7 @@ async function readMyDesign() {
         });
         return {
           nodeId: node.id,
-          document: filterFigmaNode(response.document),
+          document: filterFigmaNode(response.document, opts),
         };
       })
     );
@@ -1199,6 +1221,39 @@ async function getStyles() {
   };
 }
 
+// Derive a short semantic hint from a slash-grouped component name.
+// "Button/Primary" -> { category: "Button", role: "Primary" }
+function deriveComponentHint(name) {
+  if (!name) return {};
+  var parts = String(name)
+    .split("/")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return {};
+  var hint = { category: parts[0] };
+  if (parts.length > 1) {
+    hint.role = parts[parts.length - 1];
+  }
+  return hint;
+}
+
+// Compact componentPropertyDefinitions to { name: {type, defaultValue, options?} }.
+function compactPropertyDefinitions(defs) {
+  var out = {};
+  for (var rawName in defs) {
+    if (!Object.prototype.hasOwnProperty.call(defs, rawName)) continue;
+    var def = defs[rawName] || {};
+    // Property keys carry a "#id" suffix on instances; strip it for readability.
+    var name = rawName.split("#")[0];
+    var compact = { type: def.type };
+    if (def.defaultValue !== undefined) compact.defaultValue = def.defaultValue;
+    if (def.variantOptions) compact.options = def.variantOptions;
+    if (def.preferredValues) compact.preferredValues = def.preferredValues;
+    out[name] = compact;
+  }
+  return out;
+}
+
 async function getLocalComponents(params) {
   const commandId = (params && params.commandId) || generateCommandId();
   const pages = figma.root.children;
@@ -1221,15 +1276,45 @@ async function getLocalComponents(params) {
     var page = pages[i];
     await page.loadAsync();
 
-    var pageComponents = page.findAllWithCriteria({ types: ["COMPONENT"] });
+    // Scan component sets and standalone components. A set carries the variant
+    // axes (variantGroupProperties); its child variants are rolled up into it,
+    // so we skip components whose parent is a COMPONENT_SET to avoid duplicates.
+    var pageNodes = page.findAllWithCriteria({
+      types: ["COMPONENT", "COMPONENT_SET"],
+    });
 
-    for (var j = 0; j < pageComponents.length; j++) {
-      var component = pageComponents[j];
-      allComponents.push({
-        id: component.id,
-        name: component.name,
-        key: "key" in component ? component.key : null,
-      });
+    for (var j = 0; j < pageNodes.length; j++) {
+      var node = pageNodes[j];
+
+      if (
+        node.type === "COMPONENT" &&
+        node.parent &&
+        node.parent.type === "COMPONENT_SET"
+      ) {
+        continue; // covered by its parent set
+      }
+
+      var entry = {
+        id: node.id,
+        name: node.name,
+        key: "key" in node ? node.key : null,
+        type: node.type,
+        hint: deriveComponentHint(node.name),
+      };
+
+      // Variant axes (only on sets), e.g. { Size: {values:["sm","md"]}, State: {...} }
+      if (node.type === "COMPONENT_SET" && node.variantGroupProperties) {
+        entry.variants = node.variantGroupProperties;
+      }
+
+      // Component property definitions (TEXT/BOOLEAN/INSTANCE_SWAP), compacted.
+      if (node.componentPropertyDefinitions) {
+        entry.properties = compactPropertyDefinitions(
+          node.componentPropertyDefinitions
+        );
+      }
+
+      allComponents.push(entry);
     }
 
     var progress = Math.round(((i + 1) / totalPages) * 100);
@@ -1240,7 +1325,7 @@ async function getLocalComponents(params) {
       progress,
       totalPages,
       i + 1,
-      "Scanned " + page.name + ": " + pageComponents.length + " components (total so far: " + allComponents.length + ")",
+      "Scanned " + page.name + ": " + pageNodes.length + " component nodes (total so far: " + allComponents.length + ")",
       null
     );
   }

@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
+import { fingerprintDS, readCache, writeCache } from "./ds_cache.js";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -148,11 +149,14 @@ server.tool(
 // Read My Design Tool
 server.tool(
   "read_my_design",
-  "Get detailed information about the current selection in Figma, including all node details",
-  {},
-  async () => {
+  "Get detailed information about the current selection in Figma, including all node details. Use depth/fields to keep reads token-cheap: depth limits how many levels of children are returned, and fields:'layout' drops fills/strokes/effects/text-styling (keeps geometry, hierarchy and text content).",
+  {
+    depth: z.number().int().positive().optional().describe("Max levels of nested children to include. Omit for the full subtree."),
+    fields: z.enum(["layout", "full"]).optional().describe("'layout' = geometry + hierarchy + text only (cheapest); 'full' (default) = include fills/strokes/styles."),
+  },
+  async ({ depth, fields }: any) => {
     try {
-      const result = await sendCommandToFigma("read_my_design", {});
+      const result = await sendCommandToFigma("read_my_design", { depth, fields });
       return {
         content: [
           {
@@ -178,18 +182,20 @@ server.tool(
 // Node Info Tool
 server.tool(
   "get_node_info",
-  "Get detailed information about a specific node in Figma",
+  "Get detailed information about a specific node in Figma. Use depth/fields to keep reads token-cheap: depth limits how many levels of children are returned, and fields:'layout' drops fills/strokes/effects/text-styling (keeps geometry, hierarchy and text content).",
   {
     nodeId: z.string().describe("The ID of the node to get information about"),
+    depth: z.number().int().positive().optional().describe("Max levels of nested children to include. Omit for the full subtree."),
+    fields: z.enum(["layout", "full"]).optional().describe("'layout' = geometry + hierarchy + text only (cheapest); 'full' (default) = include fills/strokes/styles."),
   },
-  async ({ nodeId }: any) => {
+  async ({ nodeId, depth, fields }: any) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId });
+      const result = await sendCommandToFigma("get_node_info", { nodeId, depth, fields });
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNode(result))
+            text: JSON.stringify(filterFigmaNode(result, { depth, fields }))
           }
         ]
       };
@@ -221,11 +227,16 @@ function rgbaToHex(color: any): string {
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}${a === 255 ? '' : a.toString(16).padStart(2, '0')}`;
 }
 
-function filterFigmaNode(node: any) {
+function filterFigmaNode(node: any, opts: { depth?: number; fields?: "layout" | "full"; _level?: number } = {}) {
   // Skip VECTOR type nodes
   if (node.type === "VECTOR") {
     return null;
   }
+
+  const level = opts._level ?? 0;
+  // When fields === "layout" we drop heavy appearance keys (fills/strokes/styles)
+  // and keep only geometry, hierarchy and text content.
+  const layoutOnly = opts.fields === "layout";
 
   const filtered: any = {
     id: node.id,
@@ -233,7 +244,7 @@ function filterFigmaNode(node: any) {
     type: node.type,
   };
 
-  if (node.fills && node.fills.length > 0) {
+  if (!layoutOnly && node.fills && node.fills.length > 0) {
     filtered.fills = node.fills.map((fill: any) => {
       const processedFill = { ...fill };
 
@@ -264,7 +275,7 @@ function filterFigmaNode(node: any) {
     });
   }
 
-  if (node.strokes && node.strokes.length > 0) {
+  if (!layoutOnly && node.strokes && node.strokes.length > 0) {
     filtered.strokes = node.strokes.map((stroke: any) => {
       const processedStroke = { ...stroke };
       // Remove boundVariables
@@ -289,7 +300,7 @@ function filterFigmaNode(node: any) {
     filtered.characters = node.characters;
   }
 
-  if (node.style) {
+  if (!layoutOnly && node.style) {
     filtered.style = {
       fontFamily: node.style.fontFamily,
       fontStyle: node.style.fontStyle,
@@ -301,10 +312,15 @@ function filterFigmaNode(node: any) {
     };
   }
 
-  if (node.children) {
+  // Stop recursing once we hit the requested depth (depth counts levels of children).
+  const atDepthLimit = opts.depth !== undefined && level + 1 >= opts.depth;
+  if (node.children && !atDepthLimit) {
     filtered.children = node.children
-      .map((child: any) => filterFigmaNode(child))
+      .map((child: any) => filterFigmaNode(child, { ...opts, _level: level + 1 }))
       .filter((child: any) => child !== null); // Remove null children (VECTOR nodes)
+  } else if (node.children && node.children.length > 0) {
+    // Signal that children exist but were trimmed by the depth limit.
+    filtered.childCount = node.children.length;
   }
 
   return filtered;
@@ -313,15 +329,17 @@ function filterFigmaNode(node: any) {
 // Nodes Info Tool
 server.tool(
   "get_nodes_info",
-  "Get detailed information about multiple nodes in Figma",
+  "Get detailed information about multiple nodes in Figma. Use depth/fields to keep reads token-cheap: depth limits how many levels of children are returned, and fields:'layout' drops fills/strokes/effects/text-styling (keeps geometry, hierarchy and text content).",
   {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about")
+    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about"),
+    depth: z.number().int().positive().optional().describe("Max levels of nested children to include. Omit for the full subtree."),
+    fields: z.enum(["layout", "full"]).optional().describe("'layout' = geometry + hierarchy + text only (cheapest); 'full' (default) = include fills/strokes/styles."),
   },
-  async ({ nodeIds }: any) => {
+  async ({ nodeIds, depth, fields }: any) => {
     try {
       const results = await Promise.all(
         nodeIds.map(async (nodeId: any) => {
-          const result = await sendCommandToFigma('get_node_info', { nodeId });
+          const result = await sendCommandToFigma('get_node_info', { nodeId, depth, fields });
           return { nodeId, info: result };
         })
       );
@@ -329,7 +347,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info)))
+            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info, { depth, fields })))
           }
         ]
       };
@@ -1018,6 +1036,151 @@ server.tool(
   }
 );
 
+// ---------------------------------------------------------------------------
+// Design-System Manifest + search (Phase 1: Component-First Brain)
+// ---------------------------------------------------------------------------
+
+// A compact, semantic snapshot of the design system the agent reads at session
+// start so it can search-before-build instead of composing from primitives.
+type DSManifest = {
+  components: Array<{
+    id: string;
+    name: string;
+    key: string | null;
+    type?: string;
+    hint?: { category?: string; role?: string };
+    variants?: Record<string, unknown>;
+    properties?: Record<string, unknown>;
+  }>;
+  styles: any;
+  variables: any;
+};
+
+// Build (or load from cache) the semantic DS manifest for the current channel.
+// The cache is keyed on a cheap fingerprint of the raw DS state, so it is
+// rebuilt only when components/styles/variables actually change.
+async function buildDSManifest(forceRebuild = false): Promise<DSManifest> {
+  const channel = currentChannel || "default";
+
+  const componentsRes: any = await sendCommandToFigma("get_local_components");
+  const stylesRes: any = await sendCommandToFigma("get_styles");
+  const variablesRes: any = await sendCommandToFigma("get_variables");
+
+  const components = (componentsRes && componentsRes.components) || [];
+  const fingerprint = fingerprintDS({
+    components,
+    styles: stylesRes,
+    variables: variablesRes,
+  });
+
+  if (!forceRebuild) {
+    const cached = readCache<DSManifest>(channel, fingerprint);
+    if (cached) {
+      logger.info(`DS manifest cache hit for channel ${channel}`);
+      return cached.manifest;
+    }
+  }
+
+  const manifest: DSManifest = {
+    components,
+    styles: stylesRes,
+    variables: variablesRes,
+  };
+  writeCache(channel, fingerprint, manifest);
+  logger.info(`DS manifest rebuilt and cached for channel ${channel}`);
+  return manifest;
+}
+
+// Lightweight token-overlap scorer for semantic component search.
+function scoreComponentMatch(
+  query: string,
+  component: DSManifest["components"][number]
+): number {
+  const terms = query.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (terms.length === 0) return 0;
+  const haystack = [
+    component.name,
+    component.hint?.category,
+    component.hint?.role,
+    component.type,
+    ...Object.keys(component.variants || {}),
+    ...Object.keys(component.properties || {}),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  let score = 0;
+  for (const term of terms) {
+    if (haystack.includes(term)) score += 1;
+  }
+  return score / terms.length;
+}
+
+// Get Design System Manifest Tool
+server.tool(
+  "get_design_system_manifest",
+  "Get the cached, compact semantic manifest of the design system (components with variants/props/hints, styles, variables). Read this at the start of a design task so you can reuse the design system instead of building from scratch. Cached on disk and rebuilt only when the DS changes.",
+  {
+    forceRebuild: z.boolean().optional().describe("Bypass the cache and rebuild the manifest from the live file."),
+  },
+  async ({ forceRebuild }: any) => {
+    try {
+      const manifest = await buildDSManifest(!!forceRebuild);
+      return { content: [{ type: "text", text: JSON.stringify(manifest) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error building design system manifest: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// Search Design System Tool
+server.tool(
+  "search_design_system",
+  "Search the design system for a component that matches a natural-language need (e.g. 'primary button', 'product card'). Returns ranked matches with their variants and properties so you can create_component_instance and override, instead of composing from primitives. ALWAYS try this before building a UI element by hand.",
+  {
+    query: z.string().describe("What you need, in plain words (e.g. 'primary button', 'text input with error state')."),
+    limit: z.number().int().positive().optional().describe("Max matches to return (default 5)."),
+  },
+  async ({ query, limit }: any) => {
+    try {
+      const manifest = await buildDSManifest(false);
+      const ranked = manifest.components
+        .map((c) => ({ component: c, score: scoreComponentMatch(query, c) }))
+        .filter((r) => r.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit || 5);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              query,
+              matchCount: ranked.length,
+              matches: ranked.map((r) => ({ score: r.score, ...r.component })),
+            }),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error searching design system: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
 // Get Annotations Tool
 server.tool(
   "get_annotations",
@@ -1408,6 +1571,13 @@ server.prompt(
             type: "text",
             text: `When working with Figma designs, follow these best practices:
 
+0. Component-First (MANDATORY — do this before building any UI element):
+   - At the start of a task, read get_design_system_manifest() to learn the available components, styles and variables (it is cached, so this is cheap).
+   - Whenever you need a UI element (button, card, input, etc.), FIRST call search_design_system("<plain description>").
+     * Match found  -> create_component_instance() and override its text/props/variants. Do NOT hand-build it.
+     * No match     -> compose from primitives as a LAST RESORT, then offer to componentize the result.
+   - Bind colors/spacing/type to existing styles and variables (apply_style / set_bound_variable) instead of hardcoding hex values.
+
 1. Start with Document Structure:
    - First use get_document_info() to understand the current document
    - Plan your layout hierarchy before creating elements
@@ -1493,11 +1663,22 @@ server.prompt(
           role: "assistant",
           content: {
             type: "text",
-            text: `When reading Figma designs, follow these best practices:
+            text: `When reading Figma designs, read cheaply — full node-tree JSON dumps are expensive. Follow this order (Token Diet):
 
-1. Start with selection:
-   - First use read_my_design() to understand the current selection
-   - If no selection ask user to select single or multiple nodes
+1. Screenshot first:
+   - To understand layout/structure, export_node_as_image() and LOOK. A screenshot is far cheaper than JSON and shows spacing, hierarchy and color at a glance.
+
+2. Scan to locate:
+   - Use scan_nodes_by_types() to find the specific nodes you care about instead of dumping everything.
+
+3. Targeted, depth/field-limited reads:
+   - When you need structured data, call get_node_info()/get_nodes_info()/read_my_design() with:
+     * depth: limit nesting (e.g. depth:1 or 2) so you don't pull the whole subtree.
+     * fields:"layout" to get geometry + hierarchy + text only (drops fills/strokes/styles) when you don't need appearance.
+   - Only fall back to a full-tree dump (no depth/fields) when you genuinely need every detail.
+
+4. Selection:
+   - read_my_design() reads the current selection; if nothing is selected, ask the user to select node(s).
 `,
           },
         },
@@ -3101,8 +3282,9 @@ type FigmaCommand =
 type CommandParams = {
   get_document_info: Record<string, never>;
   get_selection: Record<string, never>;
-  get_node_info: { nodeId: string };
-  get_nodes_info: { nodeIds: string[] };
+  get_node_info: { nodeId: string; depth?: number; fields?: "layout" | "full" };
+  get_nodes_info: { nodeIds: string[]; depth?: number; fields?: "layout" | "full" };
+  read_my_design: { depth?: number; fields?: "layout" | "full" };
   create_rectangle: {
     x: number;
     y: number;

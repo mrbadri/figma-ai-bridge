@@ -53,6 +53,15 @@ Always pair the file first with `join_channel`.
 `scan_text_nodes`, `scan_nodes_by_types`, `get_reactions`, `get_annotations`, and
 `export_node_as_image` (PNG for visual grounding — send structure **plus** image).
 
+**Design-system reads (Component-First):** `get_design_system_manifest` (cached, compact
+inventory of components+variants+props, styles, variables — read once at task start) and
+`search_design_system("<plain need>")` (find a reusable component before hand-building it).
+
+> **Token Diet — read cheap.** Don't dump full node trees. Order: **screenshot**
+> (`export_node_as_image`) → **scan** (`scan_nodes_by_types`) → **targeted get** with `depth`
+> (limit nesting) and `fields:"layout"` (geometry+hierarchy+text only) on `get_node_info` /
+> `get_nodes_info` / `read_my_design`. Full dumps only when you truly need every detail.
+
 **Write — shapes:** `create_frame`, `create_rectangle`, `create_ellipse`, `create_line`,
 `create_polygon`, `create_star`, `create_svg` (icons — import the codebase SVG, don't redraw),
 `create_text`.
